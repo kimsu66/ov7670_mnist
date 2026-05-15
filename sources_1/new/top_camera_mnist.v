@@ -162,13 +162,21 @@ module top_camera_mnist (
 
     // ============================================================
     // 픽셀 버퍼: box_sampler가 출력하는 784픽셀을 순서대로 저장 (라이브 쓰기 버퍼)
+    //
+    // 이진화(binarization): 카메라 센서 노이즈(프레임간 ±10~30 흔들림)를
+    //   0/255 고정값으로 클램핑 → MNIST 입력이 매 프레임 안정화됨.
+    //   검정 배경(어두움) → 0x00, 흰 숫자(밝음) → 0xFF
+    //   임계값 BIN_THR 미만은 배경(0), 이상은 획(255)으로 처리.
     // ============================================================
+    localparam [7:0] BIN_THR = 8'd128;
+    wire [7:0] bin_pixel = (sampled_pixel >= BIN_THR) ? 8'hFF : 8'h00;
+
     reg [7:0] pixel_buf [0:783];
     reg [9:0] buf_wr_cnt = 10'd0;
 
     always @(posedge clk_25mhz) begin
         if (sampled_valid) begin
-            pixel_buf[buf_wr_cnt] <= sampled_pixel;
+            pixel_buf[buf_wr_cnt] <= bin_pixel;
             buf_wr_cnt <= frame_done ? 10'd0 : buf_wr_cnt + 10'd1;
         end else if (frame_done) begin
             buf_wr_cnt <= 10'd0;
@@ -308,7 +316,7 @@ module top_camera_mnist (
         if (mnist_tx_start) begin
             if (mnist_tx_data[3:0] == last_result) begin
                 stable_cnt <= stable_cnt + 1;
-                if (stable_cnt >= 4'd5) begin
+                if (stable_cnt >= 4'd10) begin
                     result_reg <= mnist_tx_data[3:0];
                 end
             end else begin

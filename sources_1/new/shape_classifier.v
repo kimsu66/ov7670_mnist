@@ -4,20 +4,28 @@
 //
 // 입력 극성: INK_THR 미만 픽셀 = 잉크 (밝은 배경 + 어두운 마커 기준)
 //
-// 분류 순서:
-//   1. 총 잉크 픽셀 < MIN_INK                        → NONE
-//   2. 상하 비대칭 > ASYM_THR                        → TRIANGLE
-//   3. 상단 코너 AND 하단 코너 모두 잉크 > CORNER_THR → SQUARE
-//   4. 나머지                                        → CIRCLE
+// 분류 순서 (순서가 핵심):
+//   1. 잉크 범위 밖                                → NONE  (흰/검은 화면)
+//   2. 2 × min행픽셀 > max행픽셀                   → SQUARE (행 균일 → 크기·위치 무관)
+//   3. 상하 비대칭 > ASYM_THR                      → TRIANGLE
+//   4. 나머지                                      → CIRCLE
 //
-// 코너 영역: 각 귀퉁이 7×7 픽셀 (rows/cols 0‑6 및 21‑27)
+// ── 핵심 원리 ─────────────────────────────────────────────────────────────
 //
-// ── 조정 파라미터 ────────────────────────────────────────────────────────
-//  INK_THR    : 잉크 판별 밝기 경계 (낮출수록 더 어두운 픽셀만 잉크로 처리)
-//  MIN_INK    : 도형으로 인정할 최소 잉크 픽셀 수
-//  ASYM_THR   : 삼각형 판별 상하 비대칭 임계값 (픽셀 수 차이)
-//  CORNER_THR : 사각형 판별 코너 잉크 임계값 (상단/하단 각각)
-// ─────────────────────────────────────────────────────────────────────────
+//  사각형: 도형 내 모든 행의 폭이 같음  → row_min ≈ row_max → 2*min > max
+//  원    : 중간 행이 넓고 위아래가 좁음 → row_min << row_max → 2*min ≤ max
+//  삼각형: 한쪽 끝이 좁고 다른 쪽이 넓음 → 2*min ≤ max + 상하 비대칭 큼
+//
+//  → 사각형을 먼저 체크해야 함. 치우친 사각형도 삼각형 조건(ASYM)에 걸리지 않도록
+//    사각형 체크가 우선권을 가져야 올바르게 분류됨.
+//
+// ── 조정 파라미터 ─────────────────────────────────────────────────────────
+//  INK_THR   : 잉크 판별 밝기 경계
+//  MIN_INK   : 도형 인정 최소 잉크 픽셀 수 (흰 화면 거부)
+//  MAX_INK   : 도형 인정 최대 잉크 픽셀 수 (검은 화면 거부)
+//  ASYM_THR  : 삼각형 판별 상하 비대칭 임계값 (픽셀 수 차이)
+//              너무 낮으면 치우친 사각형이 삼각형으로 오인됨 → 50 이상 권장
+// ──────────────────────────────────────────────────────────────────────────
 
 module shape_classifier (
     input  wire        clk,
@@ -29,10 +37,10 @@ module shape_classifier (
     output reg         shape_valid  // frame_done 시점 1클럭 펄스
 );
 
-    localparam [7:0] INK_THR    = 8'd128;
-    localparam [9:0] MIN_INK    = 10'd30;
-    localparam [8:0] ASYM_THR   = 9'd20;
-    localparam [7:0] CORNER_THR = 8'd3;
+    localparam [7:0] INK_THR  = 8'd128;
+    localparam [9:0] MIN_INK  = 10'd30;   // 이 미만 → 흰 화면 → NONE
+    localparam [9:0] MAX_INK  = 10'd700;  // 이 초과 → 검은 화면 → NONE
+    localparam [8:0] ASYM_THR = 9'd50;   // 삼각형 상하 비대칭 임계값
 
     localparam [1:0] NONE     = 2'b00;
     localparam [1:0] CIRCLE   = 2'b01;
@@ -40,8 +48,6 @@ module shape_classifier (
     localparam [1:0] SQUARE   = 2'b11;
 
     // ── 픽셀 좌표 추적 ────────────────────────────────────────────────
-    // sampled_valid 마다 col→row 순으로 증가
-    // frame_done (마지막 sampled_valid와 동시)에서 리셋
     reg [4:0] row_cnt;  // 0..27
     reg [4:0] col_cnt;  // 0..27
 
@@ -50,7 +56,6 @@ module shape_classifier (
             row_cnt <= 5'd0;
             col_cnt <= 5'd0;
         end else if (frame_done) begin
-            // frame_done 사이클: 아직 row=27, col=27 → 분류에 사용 후 리셋
             row_cnt <= 5'd0;
             col_cnt <= 5'd0;
         end else if (sampled_valid) begin
@@ -63,72 +68,91 @@ module shape_classifier (
     end
 
     // ── 픽셀 속성 (조합 논리) ─────────────────────────────────────────
-    wire is_ink        = sampled_valid && (sampled_pixel < INK_THR);
-    wire is_top        = (row_cnt < 5'd14);           // 상반부 행 0~13
-    wire is_bot        = (row_cnt >= 5'd14);          // 하반부 행 14~27
-    wire is_top_row    = (row_cnt <= 5'd6);           // 상단 코너 행
-    wire is_bot_row    = (row_cnt >= 5'd21);          // 하단 코너 행
-    wire is_lft_col    = (col_cnt <= 5'd6);           // 좌측 코너 열
-    wire is_rgt_col    = (col_cnt >= 5'd21);          // 우측 코너 열
-    wire is_top_corner = is_top_row && (is_lft_col || is_rgt_col);  // 상단 좌·우 코너
-    wire is_bot_corner = is_bot_row && (is_lft_col || is_rgt_col);  // 하단 좌·우 코너
+    wire is_ink     = sampled_valid && (sampled_pixel < INK_THR);
+    wire is_top     = (row_cnt < 5'd14);
+    wire is_bot     = (row_cnt >= 5'd14);
+    wire is_row_end = sampled_valid && (col_cnt == 5'd27);
 
     // ── 누산기 ────────────────────────────────────────────────────────
     reg [9:0] total_ink;
     reg [8:0] top_ink;
     reg [8:0] bot_ink;
-    reg [7:0] top_corner_ink;  // 상단 좌+우 코너 잉크 합 (최대 98)
-    reg [7:0] bot_corner_ink;  // 하단 좌+우 코너 잉크 합 (최대 98)
+    reg [5:0] row_ink;    // 현재 행 잉크 픽셀 수 (max 28)
+    reg [5:0] row_max_r;  // 지금까지 비어있지 않은 행의 최대 픽셀 수
+    reg [5:0] row_min_r;  // 지금까지 비어있지 않은 행의 최소 픽셀 수 (초기 sentinel=28)
 
-    // frame_done과 sampled_valid가 동시인 마지막 픽셀도 분류에 포함하기 위해
-    // 현재 픽셀 기여분을 조합으로 더한 cur_ 와이어를 분류에 사용한다
-    wire [9:0] cur_total      = total_ink      + (is_ink                  ? 10'd1 : 10'd0);
-    wire [8:0] cur_top        = top_ink        + (is_ink && is_top        ?  9'd1 :  9'd0);
-    wire [8:0] cur_bot        = bot_ink        + (is_ink && is_bot        ?  9'd1 :  9'd0);
-    wire [7:0] cur_top_corner = top_corner_ink + (is_ink && is_top_corner ?  8'd1 :  8'd0);
-    wire [7:0] cur_bot_corner = bot_corner_ink + (is_ink && is_bot_corner ?  8'd1 :  8'd0);
+    wire [9:0] cur_total   = total_ink + (is_ink          ? 10'd1 : 10'd0);
+    wire [8:0] cur_top     = top_ink   + (is_ink && is_top ?  9'd1 :  9'd0);
+    wire [8:0] cur_bot     = bot_ink   + (is_ink && is_bot ?  9'd1 :  9'd0);
+    wire [5:0] cur_row_ink = row_ink   + (is_ink           ?  6'd1 :  6'd0);
 
+    // frame_done 시 마지막 행(row 27)까지 포함한 최종 max/min
+    wire [5:0] final_row_max = (cur_row_ink > row_max_r) ? cur_row_ink : row_max_r;
+    wire [5:0] final_row_min = (cur_row_ink > 6'd0 && cur_row_ink < row_min_r)
+                               ? cur_row_ink : row_min_r;
+
+    // ── 분류 조건 (조합 논리) ─────────────────────────────────────────
     wire [8:0] asym = (cur_bot >= cur_top) ? (cur_bot - cur_top) :
                                               (cur_top - cur_bot);
 
+    // 사각형 조건: 2 × min > max  (모든 행 폭이 균일 → 크기·위치 무관)
+    // 원:  min이 max보다 훨씬 작음 (위아래 행이 좁음) → 조건 불성립
+    // 삼각형: min ≈ 0 (꼭짓점 행) → 조건 불성립
+    wire is_sq = (final_row_min != 6'd0) &&
+                 ({final_row_min, 1'b0} > {1'b0, final_row_max});
+    //           ↑ 7비트: 2*min         ↑ 7비트: max (MSB=0)
+
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            total_ink      <= 10'd0;
-            top_ink        <=  9'd0;
-            bot_ink        <=  9'd0;
-            top_corner_ink <=  8'd0;
-            bot_corner_ink <=  8'd0;
-            shape          <= NONE;
-            shape_valid    <= 1'b0;
+            total_ink  <= 10'd0;
+            top_ink    <=  9'd0;
+            bot_ink    <=  9'd0;
+            row_ink    <=  6'd0;
+            row_max_r  <=  6'd0;
+            row_min_r  <=  6'd28;
+            shape      <= NONE;
+            shape_valid <= 1'b0;
         end else begin
             shape_valid <= 1'b0;
 
             if (frame_done) begin
-                // ── 분류 (cur_ = 마지막 픽셀까지 포함한 값) ──────────
-                if (cur_total < MIN_INK)
-                    shape <= NONE;
+                // ── 분류 ──────────────────────────────────────────────
+                if (cur_total < MIN_INK || cur_total > MAX_INK)
+                    shape <= NONE;      // 흰 화면 or 검은 화면
+                else if (is_sq)
+                    shape <= SQUARE;    // 행 균일 → 치우쳐 있어도 정상 검출
                 else if (asym > ASYM_THR)
-                    shape <= TRIANGLE;
-                else if (cur_top_corner > CORNER_THR && cur_bot_corner > CORNER_THR)
-                    shape <= SQUARE;
+                    shape <= TRIANGLE;  // 상하 비대칭
                 else
-                    shape <= CIRCLE;
+                    shape <= CIRCLE;    // 대칭 + 행 불균일
 
                 shape_valid <= 1'b1;
 
-                // ── 누산기 리셋 ───────────────────────────────────────
-                total_ink      <= 10'd0;
-                top_ink        <=  9'd0;
-                bot_ink        <=  9'd0;
-                top_corner_ink <=  8'd0;
-                bot_corner_ink <=  8'd0;
+                // ── 리셋 ──────────────────────────────────────────────
+                total_ink  <= 10'd0;
+                top_ink    <=  9'd0;
+                bot_ink    <=  9'd0;
+                row_ink    <=  6'd0;
+                row_max_r  <=  6'd0;
+                row_min_r  <=  6'd28;
+
+            end else if (is_row_end) begin
+                // ── 행 끝: max/min 갱신 후 row_ink 리셋 ─────────────
+                if (cur_row_ink > 6'd0) begin
+                    if (cur_row_ink > row_max_r) row_max_r <= cur_row_ink;
+                    if (cur_row_ink < row_min_r) row_min_r <= cur_row_ink;
+                end
+                row_ink   <= 6'd0;
+                total_ink <= cur_total;
+                top_ink   <= cur_top;
+                bot_ink   <= cur_bot;
 
             end else if (sampled_valid) begin
-                total_ink      <= cur_total;
-                top_ink        <= cur_top;
-                bot_ink        <= cur_bot;
-                top_corner_ink <= cur_top_corner;
-                bot_corner_ink <= cur_bot_corner;
+                // ── 픽셀 누산 ─────────────────────────────────────────
+                row_ink   <= cur_row_ink;
+                total_ink <= cur_total;
+                top_ink   <= cur_top;
+                bot_ink   <= cur_bot;
             end
         end
     end
