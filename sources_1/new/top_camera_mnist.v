@@ -122,11 +122,72 @@ module top_camera_mnist (
         ((vga_y == 10'd92  || vga_y == 10'd93  ||
           vga_y == 10'd146 || vga_y == 10'd147) && in_blue_h)
     );
-    wire [3:0] gray4 = pixel_out[7:4];
+    wire [3:0] gray4   = pixel_out[7:4];
+    wire       in_cam  = img_active;   // x<320, y<240
 
-    assign vgaRed   = (vga_active && img_active) ? (on_border ? 4'hF : (on_blue_border ? 4'h0 : gray4)) : 4'b0;
-    assign vgaGreen = (vga_active && img_active) ? (on_border ? 4'h0 : (on_blue_border ? 4'h0 : gray4)) : 4'b0;
-    assign vgaBlue  = (vga_active && img_active) ? (on_border ? 4'h0 : (on_blue_border ? 4'hF : gray4)) : 4'b0;
+    // ============================================================
+    // 가운데 구분선 (x: 326..329, 흰색 4픽셀)
+    // ============================================================
+    wire on_divider = (vga_x >= 10'd326) && (vga_x <= 10'd329);
+
+    // ============================================================
+    // 280×280 업스케일 표시 — 오른쪽 반(320..639) 중앙
+    //   가로 중앙: 320 + (320-280)/2 = 340  →  x: 340..619
+    //   세로 중앙: (480-280)/2 = 100         →  y: 100..379
+    //
+    // 10 나누기: floor(n * 205 / 2048), n=0..279 오차 없음
+    // 18비트 중간값 명시 — 9비트 컨텍스트면 곱셈이 0으로 잘림
+    // ============================================================
+    localparam [9:0] UP_X0 = 10'd340;
+    localparam [9:0] UP_Y0 = 10'd100;
+
+    wire in_up_h = (vga_x >= UP_X0) && (vga_x < UP_X0 + 10'd280);
+    wire in_up_v = (vga_y >= UP_Y0) && (vga_y < UP_Y0 + 10'd280);
+    wire in_up   = in_up_h && in_up_v;
+
+    wire [8:0]  vx_loc  = vga_x - UP_X0;
+    wire [8:0]  vy_loc  = vga_y - UP_Y0;
+    wire [17:0] vx_prod = {9'b0, vx_loc} * 18'd205;
+    wire [17:0] vy_prod = {9'b0, vy_loc} * 18'd205;
+    wire [4:0]  col_28  = vx_prod[15:11];   // 0..27
+    wire [4:0]  row_28  = vy_prod[15:11];   // 0..27
+
+    wire [9:0] buf_addr = ({5'b0, row_28} << 5)
+                        - ({5'b0, row_28} << 2)
+                        + {5'b0, col_28};
+
+    wire [7:0] up_pixel    = snapshot_buf[buf_addr];
+    // wire [3:0] up_gray     = up_pixel[7:4];
+    wire [3:0] up_gray     = up_pixel[3:0];
+    wire       on_up_border = in_up && (
+        vga_x == UP_X0           || vga_x == UP_X0 + 10'd279 ||
+        vga_y == UP_Y0           || vga_y == UP_Y0 + 10'd279
+    );
+
+    // ============================================================
+    // VGA 출력 합성 (좌: 카메라 원본 / 우: 28×28 × 10배 업스케일)
+    // ============================================================
+    wire [3:0] out_r =
+        on_divider  ? 4'hF :
+        in_cam      ? (on_border ? 4'hF : (on_blue_border ? 4'h0 : gray4)) :
+        in_up       ? (on_up_border ? 4'hF : up_gray) :
+        4'b0;
+
+    wire [3:0] out_g =
+        on_divider  ? 4'hF :
+        in_cam      ? (on_border ? 4'h0 : (on_blue_border ? 4'h0 : gray4)) :
+        in_up       ? (on_up_border ? 4'hF : up_gray) :
+        4'b0;
+
+    wire [3:0] out_b =
+        on_divider  ? 4'hF :
+        in_cam      ? (on_border ? 4'h0 : (on_blue_border ? 4'hF : gray4)) :
+        in_up       ? (on_up_border ? 4'hF : up_gray) :
+        4'b0;
+
+    assign vgaRed   = vga_active ? out_r : 4'b0;
+    assign vgaGreen = vga_active ? out_g : 4'b0;
+    assign vgaBlue  = vga_active ? out_b : 4'b0;
 
     // ============================================================
     // box_sampler: 박스 안에서 5픽셀마다 샘플링 → 28×28
@@ -163,20 +224,16 @@ module top_camera_mnist (
     // ============================================================
     // 픽셀 버퍼: box_sampler가 출력하는 784픽셀을 순서대로 저장 (라이브 쓰기 버퍼)
     //
-    // 이진화(binarization): 카메라 센서 노이즈(프레임간 ±10~30 흔들림)를
-    //   0/255 고정값으로 클램핑 → MNIST 입력이 매 프레임 안정화됨.
-    //   검정 배경(어두움) → 0x00, 흰 숫자(밝음) → 0xFF
-    //   임계값 BIN_THR 미만은 배경(0), 이상은 획(255)으로 처리.
+    // 4비트 그레이값(0~15)으로 전달: 학습 코드가 x*15 변환으로
+    // 0~15 범위를 입력으로 사용했으므로 FPGA도 동일하게 맞춤.
+    // sampled_pixel = {avg4, avg4} 형태이므로 [7:4]가 실제 4비트 평균값.
     // ============================================================
-    localparam [7:0] BIN_THR = 8'd128;
-    wire [7:0] bin_pixel = (sampled_pixel >= BIN_THR) ? 8'hFF : 8'h00;
-
     reg [7:0] pixel_buf [0:783];
     reg [9:0] buf_wr_cnt = 10'd0;
 
     always @(posedge clk_25mhz) begin
         if (sampled_valid) begin
-            pixel_buf[buf_wr_cnt] <= bin_pixel;
+            pixel_buf[buf_wr_cnt] <= {4'b0, sampled_pixel[7:4]};  // 0~15
             buf_wr_cnt <= frame_done ? 10'd0 : buf_wr_cnt + 10'd1;
         end else if (frame_done) begin
             buf_wr_cnt <= 10'd0;
