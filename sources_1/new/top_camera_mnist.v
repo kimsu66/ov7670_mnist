@@ -161,7 +161,7 @@ module top_camera_mnist (
     );
 
     // ============================================================
-    // 픽셀 버퍼: box_sampler가 출력하는 784픽셀을 순서대로 저장
+    // 픽셀 버퍼: box_sampler가 출력하는 784픽셀을 순서대로 저장 (라이브 쓰기 버퍼)
     // ============================================================
     reg [7:0] pixel_buf [0:783];
     reg [9:0] buf_wr_cnt = 10'd0;
@@ -169,10 +169,48 @@ module top_camera_mnist (
     always @(posedge clk_25mhz) begin
         if (sampled_valid) begin
             pixel_buf[buf_wr_cnt] <= sampled_pixel;
-            // frame_done(784번째)이면 다음 프레임을 위해 카운터 리셋
             buf_wr_cnt <= frame_done ? 10'd0 : buf_wr_cnt + 10'd1;
         end else if (frame_done) begin
             buf_wr_cnt <= 10'd0;
+        end
+    end
+
+    // ============================================================
+    // 스냅샷 버퍼: frame_done 후 pixel_buf 전체를 복사 → MNIST 전용 읽기 버퍼
+    //
+    // 문제: box_sampler가 vga_y=92~147을 스캔하는 수십 μs 동안
+    //       카메라가 frame_buffer를 계속 갱신하므로 pixel_buf 안에
+    //       서로 다른 시간대의 픽셀이 섞인다.
+    // 해결: frame_done(마지막 픽셀 확정) 이후 784사이클에 걸쳐
+    //       pixel_buf → snapshot_buf로 복사하고, 복사 완료 시점에만
+    //       MNIST가 읽도록 함 → 한 프레임 내 일관성 확보.
+    // ============================================================
+    reg [7:0] snapshot_buf [0:783];
+    reg [9:0] copy_cnt       = 10'd0;
+    reg       copying        = 1'b0;
+    reg       snapshot_ready = 1'b0;  // 1클럭 펄스: 복사 완료 & MNIST 기동 가능
+    reg       snapshot_digit = 1'b0;  // 해당 프레임의 digit_detected 래치
+
+    always @(posedge clk_25mhz) begin
+        snapshot_ready <= 1'b0;
+
+        // frame_done 1사이클 후(frame_done_d) 복사 시작
+        // - pixel_buf[783]의 non-blocking 쓰기가 이미 완료된 시점
+        // - digit_detected도 digit_detector에서 1사이클 지연 후 확정된 값
+        if (frame_done_d && !copying) begin
+            copying        <= 1'b1;
+            copy_cnt       <= 10'd0;
+            snapshot_digit <= digit_detected;
+        end
+
+        if (copying) begin
+            snapshot_buf[copy_cnt] <= pixel_buf[copy_cnt];
+            if (copy_cnt == 10'd783) begin
+                copying        <= 1'b0;
+                snapshot_ready <= 1'b1;
+            end else begin
+                copy_cnt <= copy_cnt + 10'd1;
+            end
         end
     end
 
@@ -193,13 +231,15 @@ module top_camera_mnist (
         mx_rx_valid <= 1'b0;
         case (stream_st)
             ST_IDLE: begin
-                if (digit_detected) begin
+                // snapshot_ready: 복사 완료 1클럭 펄스
+                // snapshot_digit: 해당 프레임에서 숫자가 감지됐는지 여부
+                if (snapshot_ready && snapshot_digit) begin
                     rd_cnt    <= 10'd0;
                     stream_st <= ST_STREAM;
                 end
             end
             ST_STREAM: begin
-                mx_rx_data  <= pixel_buf[rd_cnt];
+                mx_rx_data  <= snapshot_buf[rd_cnt];  // pixel_buf 대신 snapshot_buf 사용
                 mx_rx_valid <= 1'b1;
                 if (rd_cnt == 10'd783) begin
                     rd_cnt    <= 10'd0;
