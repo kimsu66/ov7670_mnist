@@ -72,7 +72,7 @@ module mnist_core (
     reg        fc2_start;
     reg  [7:0] fc2_act_data;
     reg        fc2_act_valid;
-    wire signed [15:0] fc2_out_data;
+    wire signed [23:0] fc2_out_data;
     wire       fc2_out_valid;
     wire       fc2_done;
 

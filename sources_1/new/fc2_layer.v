@@ -4,7 +4,7 @@ module fc2_layer (
     input  wire        start,
     input  wire [7:0]  act_data,    // FC1 출력 activation (1개씩)
     input  wire        act_valid,
-    output reg  signed [15:0]  out_data,    // FC2 출력 (0~9 점수, 1개씩)
+    output reg  signed [23:0]  out_data,    // FC2 출력 (0~9 점수, 1개씩)
     output reg         out_valid,
     output reg         done
 );
@@ -118,7 +118,7 @@ module fc2_layer (
                 // bias 더하기, ReLU 없음, 출력
                 OUTPUT: begin
                     // FC2는 ReLU 없음 → 음수도 그대로 출력 (signed)
-                    out_data  <= acc_with_bias[15:0];
+                    out_data  <= acc_with_bias;
                     out_valid <= 1;
 
                     if (neuron_idx == 9) begin
