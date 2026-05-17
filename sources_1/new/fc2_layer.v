@@ -1,44 +1,41 @@
+`timescale 1ns / 1ps
+
 module fc2_layer (
     input  wire        clk,
     input  wire        rst,
     input  wire        start,
-    input  wire [7:0]  act_data,    // FC1 출력 activation (1개씩)
+    input  wire [7:0]  act_data,
     input  wire        act_valid,
-    output reg  signed [23:0]  out_data,    // FC2 출력 (0~9 점수, 1개씩)
+    output reg  signed [23:0] out_data,
     output reg         out_valid,
     output reg         done
 );
 
-    localparam IDLE      = 3'd0;
-    localparam LOAD      = 3'd1;
-    localparam COMPUTE   = 3'd2;
-    localparam BIAS_WAIT = 3'd3;
-    localparam OUTPUT    = 3'd4;
+    localparam IDLE       = 3'd0;
+    localparam LOAD       = 3'd1;
+    localparam ADDR_SETUP = 3'd2;  // 추가: BRAM addr 세팅 준비 사이클
+    localparam COMPUTE    = 3'd3;
+    localparam BIAS_WAIT  = 3'd4;
+    localparam OUTPUT     = 3'd5;
 
     reg [2:0] state;
 
-    // 입력 버퍼 (FC1 출력 64개)
     reg [7:0] act_buf [0:63];
-    reg [5:0] act_cnt;   // 0~63
+    reg [5:0] act_cnt;
 
-    // BRAM 인터페이스 - fc2_weight (10*64=640)
-    reg  [9:0] w_addr;   // 0~639
+    reg  [9:0] w_addr;
     wire [7:0] w_data;
 
-    // BRAM 인터페이스 - fc2_bias (10개)
-    reg  [3:0] b_addr;   // 0~9
+    reg  [3:0] b_addr;
     wire [7:0] b_data;
 
-    // 연산용
-    reg  [3:0]         neuron_idx;  // 0~9
-    reg  [6:0]         act_idx;     // 0~64 (64 도달 확인용으로 7비트 필요)
+    reg  [3:0]         neuron_idx;
+    reg  [6:0]         act_idx;
     reg  signed [23:0] accumulator;
-    // INT8*INT8*64 = 127*127*64 ≈ 1M → 24비트 (20비트는 오버플로우 가능)
 
     wire signed [23:0] acc_with_bias;
     assign acc_with_bias = accumulator + $signed({{16{b_data[7]}}, b_data});
 
-    // BRAM 인스턴스
     fc2_weight fc2_weight_bram (
         .clka  (clk),
         .addra (w_addr),
@@ -61,6 +58,8 @@ module fc2_layer (
             out_data    <= 0;
             out_valid   <= 0;
             done        <= 0;
+            w_addr      <= 0;
+            b_addr      <= 0;
         end else begin
             case (state)
 
@@ -73,34 +72,43 @@ module fc2_layer (
                     end
                 end
 
-                // FC1 출력 64개 버퍼에 저장
                 LOAD: begin
                     if (act_valid) begin
                         act_buf[act_cnt] <= act_data;
                         act_cnt <= act_cnt + 1;
                         if (act_cnt == 63) begin
                             neuron_idx  <= 0;
-                            act_idx     <= 0;
                             accumulator <= 0;
-                            w_addr      <= 0;
-                            b_addr      <= 0;
-                            state       <= COMPUTE;
+                            state       <= ADDR_SETUP;  // COMPUTE 대신 ADDR_SETUP
                         end
                     end
                 end
 
-                // MAC: y[neuron] += w[neuron][act] * act[act]
+                // BRAM addr 첫 번째 세팅 사이클
+                // act_idx=0 기준으로 addr 세팅, act_idx를 1로 올림
+                // 다음 사이클(COMPUTE)에서 w_data[0]이 유효
+                ADDR_SETUP: begin
+                    w_addr  <= {6'd0, neuron_idx} * 10'd64;  // neuron*64 + 0
+                    act_idx <= 1;
+                    state   <= COMPUTE;
+                end
+
+                // MAC 연산
+                // act_idx=1일 때: w_data = w[neuron][0] 유효
+                //   → act_buf[0]과 곱 (act_idx-1=0)
+                // act_idx=64일 때: w_data = w[neuron][63] 유효
+                //   → act_buf[63]과 곱 후 BIAS_WAIT
                 COMPUTE: begin
                     out_valid <= 0;
 
-                    if (act_idx < 64) begin  // ← 조건 추가
+                    // 다음 주소 세팅 (64 이전까지만)
+                    if (act_idx < 64) begin
                         w_addr <= ({6'd0, neuron_idx} * 10'd64) + {4'd0, act_idx};
                     end
 
-                    if (act_idx > 0) begin
-                        accumulator <= accumulator +
-                            $signed(w_data) * $signed({1'b0, act_buf[act_idx - 1]});
-                    end
+                    // 현재 w_data (act_idx-1 기준) 누적
+                    accumulator <= accumulator +
+                        $signed(w_data) * $signed({1'b0, act_buf[act_idx - 1]});
 
                     if (act_idx == 64) begin
                         b_addr <= neuron_idx;
@@ -110,14 +118,11 @@ module fc2_layer (
                     end
                 end
 
-                // bias BRAM 레이턴시 1클럭 대기
                 BIAS_WAIT: begin
                     state <= OUTPUT;
                 end
 
-                // bias 더하기, ReLU 없음, 출력
                 OUTPUT: begin
-                    // FC2는 ReLU 없음 → 음수도 그대로 출력 (signed)
                     out_data  <= acc_with_bias;
                     out_valid <= 1;
 
@@ -126,9 +131,8 @@ module fc2_layer (
                         state <= IDLE;
                     end else begin
                         neuron_idx  <= neuron_idx + 1;
-                        act_idx     <= 0;
                         accumulator <= 0;
-                        state       <= COMPUTE;
+                        state       <= ADDR_SETUP;  // COMPUTE 대신 ADDR_SETUP
                     end
                 end
 
