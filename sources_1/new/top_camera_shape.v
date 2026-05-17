@@ -5,13 +5,19 @@
 // 파이프라인:
 //   OV7670 → frame_buffer → box_sampler(56×56→28×28) → shape_classifier → LED
 //
+// 화면 구성:
+//   좌(0~319): 카메라 원본 + 빨간(140×140)/파란(56×56) 박스 오버레이
+//   구분선(326~329): 흰색 세로선
+//   우(340~619): 28×28 스냅샷 × 10배 (280×280) 업스케일 표시
+//
 // LED 인코딩:
-//   4'b0000 : 도형 없음
+//   4'b0000 : 흰 배경 (잉크 부족 → 아무것도 없는 화면)
+//   4'b1111 : 검은 배경 (잉크 과다 → 카메라 가려짐)
 //   4'b0001 : ○ (원)
 //   4'b0111 : △ (삼각형)
-//   4'b1111 : □ (사각형)
+//   4'b1110 : + (십자)
 //
-// 4프레임 연속 동일 결과 시 LED 갱신 (흔들림 방지)
+// 4프레임 연속 동일 결과 시 LED 갱신 (흔들림 방지, NONE 제외)
 
 module top_camera_shape (
     input  wire       clk,          // 100 MHz 시스템 클럭
@@ -97,10 +103,9 @@ module top_camera_shape (
     // ============================================================
     wire [8:0]  fb_x      = vga_x[8:0];
     wire [7:0]  fb_y      = vga_y[7:0];
-    wire        img_active = (vga_x < 10'd320) && (vga_y < 10'd240);
-    wire [16:0] read_addr  = {1'b0, fb_y, 8'b0}
-                           + {3'b0, fb_y, 6'b0}
-                           + {8'b0, fb_x};
+    wire [16:0] read_addr = {1'b0, fb_y, 8'b0}
+                          + {3'b0, fb_y, 6'b0}
+                          + {8'b0, fb_x};
     wire [7:0] pixel_out;
 
     frame_buffer u_fb (
@@ -112,33 +117,6 @@ module top_camera_shape (
         .read_addr  (read_addr),
         .pixel_out  (pixel_out)
     );
-
-    // ============================================================
-    // VGA 출력 (샘플링 영역 오버레이)
-    // 빨간 박스: 전체 관심 영역 (140×140)
-    // 파란 박스: 56×56 실제 샘플링 영역
-    // ============================================================
-    wire in_box_h    = (vga_x >= 10'd90)  && (vga_x <= 10'd229);
-    wire in_box_v    = (vga_y >= 10'd50)  && (vga_y <= 10'd189);
-    wire on_border   = (
-        ((vga_x == 10'd90  || vga_x == 10'd91  ||
-          vga_x == 10'd228 || vga_x == 10'd229) && in_box_v) ||
-        ((vga_y == 10'd50  || vga_y == 10'd51  ||
-          vga_y == 10'd188 || vga_y == 10'd189) && in_box_h)
-    );
-    wire in_blue_h      = (vga_x >= 10'd132) && (vga_x <= 10'd187);
-    wire in_blue_v      = (vga_y >= 10'd92)  && (vga_y <= 10'd147);
-    wire on_blue_border = (
-        ((vga_x == 10'd132 || vga_x == 10'd133 ||
-          vga_x == 10'd186 || vga_x == 10'd187) && in_blue_v) ||
-        ((vga_y == 10'd92  || vga_y == 10'd93  ||
-          vga_y == 10'd146 || vga_y == 10'd147) && in_blue_h)
-    );
-    wire [3:0] gray4 = pixel_out[7:4];
-
-    assign vgaRed   = (vga_active && img_active) ? (on_border ? 4'hF : (on_blue_border ? 4'h0 : gray4)) : 4'b0;
-    assign vgaGreen = (vga_active && img_active) ? (on_border ? 4'h0 : (on_blue_border ? 4'h0 : gray4)) : 4'b0;
-    assign vgaBlue  = (vga_active && img_active) ? (on_border ? 4'h0 : (on_blue_border ? 4'hF : gray4)) : 4'b0;
 
     // ============================================================
     // box_sampler: 56×56 영역 → 2×2 평균 풀링 → 28×28
@@ -159,10 +137,11 @@ module top_camera_shape (
     );
 
     // ============================================================
-    // shape_classifier: 28×28 스트림 → ○ △ □ 분류
+    // shape_classifier: 28×28 스트림 → ○ △ + 분류
     // ============================================================
     wire [1:0] shape;
     wire       shape_valid;
+    wire       is_dark;
 
     shape_classifier u_shape (
         .clk          (clk_25mhz),
@@ -171,15 +150,144 @@ module top_camera_shape (
         .sampled_valid(sampled_valid),
         .frame_done   (frame_done),
         .shape        (shape),
-        .shape_valid  (shape_valid)
+        .shape_valid  (shape_valid),
+        .is_dark      (is_dark)
     );
 
     // ============================================================
-    // LED 출력 (4프레임 연속 동일 결과 시 갱신)
-    //   4'b0000 : 없음
-    //   4'b0001 : ○
-    //   4'b0111 : △
-    //   4'b1111 : □
+    // 28×28 픽셀 버퍼 (sampled_valid 순서대로 순차 저장)
+    // shape_classifier에 들어가는 바로 그 픽셀을 동일하게 저장
+    // ============================================================
+    reg [7:0] pixel_buf [0:783];
+    reg [9:0] buf_wr_cnt = 10'd0;
+
+    always @(posedge clk_25mhz) begin
+        if (sampled_valid) begin
+            pixel_buf[buf_wr_cnt] <= sampled_pixel;
+            buf_wr_cnt <= frame_done ? 10'd0 : buf_wr_cnt + 10'd1;
+        end else if (frame_done) begin
+            buf_wr_cnt <= 10'd0;
+        end
+    end
+
+    // ============================================================
+    // 스냅샷 버퍼: frame_done 후 pixel_buf 전체 복사
+    // (VGA 렌더링 중 pixel_buf가 덮어쓰이는 것을 방지)
+    // ============================================================
+    reg [7:0] snapshot_buf [0:783];
+    reg [9:0] copy_cnt = 10'd0;
+    reg       copying  = 1'b0;
+
+    reg frame_done_d = 1'b0;
+    always @(posedge clk_25mhz) frame_done_d <= frame_done;
+
+    always @(posedge clk_25mhz) begin
+        if (frame_done_d && !copying) begin
+            copying  <= 1'b1;
+            copy_cnt <= 10'd0;
+        end
+        if (copying) begin
+            snapshot_buf[copy_cnt] <= pixel_buf[copy_cnt];
+            if (copy_cnt == 10'd783)
+                copying <= 1'b0;
+            else
+                copy_cnt <= copy_cnt + 10'd1;
+        end
+    end
+
+    // ============================================================
+    // VGA 좌측: 카메라 원본 + 오버레이 박스
+    //   빨간 박스: 140×140 관심 영역 (x:90~229, y:50~189)
+    //   파란 박스: 56×56 실제 샘플링 영역 (x:132~187, y:92~147)
+    // ============================================================
+    wire in_cam    = (vga_x < 10'd320) && (vga_y < 10'd240);
+    wire in_box_h  = (vga_x >= 10'd90)  && (vga_x <= 10'd229);
+    wire in_box_v  = (vga_y >= 10'd50)  && (vga_y <= 10'd189);
+    wire on_border = (
+        ((vga_x == 10'd90  || vga_x == 10'd91  ||
+          vga_x == 10'd228 || vga_x == 10'd229) && in_box_v) ||
+        ((vga_y == 10'd50  || vga_y == 10'd51  ||
+          vga_y == 10'd188 || vga_y == 10'd189) && in_box_h)
+    );
+    wire in_blue_h      = (vga_x >= 10'd132) && (vga_x <= 10'd187);
+    wire in_blue_v      = (vga_y >= 10'd92)  && (vga_y <= 10'd147);
+    wire on_blue_border = (
+        ((vga_x == 10'd132 || vga_x == 10'd133 ||
+          vga_x == 10'd186 || vga_x == 10'd187) && in_blue_v) ||
+        ((vga_y == 10'd92  || vga_y == 10'd93  ||
+          vga_y == 10'd146 || vga_y == 10'd147) && in_blue_h)
+    );
+    wire [3:0] gray4 = pixel_out[7:4];
+
+    // ============================================================
+    // 가운데 구분선 (x: 326~329, 흰색 4픽셀)
+    // ============================================================
+    wire on_divider = (vga_x >= 10'd326) && (vga_x <= 10'd329);
+
+    // ============================================================
+    // VGA 우측: 280×280 업스케일 표시
+    //   가로 중앙: 320 + (320-280)/2 = 340  →  x: 340~619
+    //   세로 중앙: (480-280)/2 = 100         →  y: 100~379
+    //
+    // /10 근사: floor(n * 205 / 2048)  (n=0..279, 오차 없음)
+    // ============================================================
+    localparam [9:0] UP_X0 = 10'd340;
+    localparam [9:0] UP_Y0 = 10'd100;
+
+    wire in_up_h = (vga_x >= UP_X0) && (vga_x < UP_X0 + 10'd280);
+    wire in_up_v = (vga_y >= UP_Y0) && (vga_y < UP_Y0 + 10'd280);
+    wire in_up   = in_up_h && in_up_v;
+
+    wire [8:0]  vx_loc  = vga_x - UP_X0;
+    wire [8:0]  vy_loc  = vga_y - UP_Y0;
+    wire [17:0] vx_prod = {9'b0, vx_loc} * 18'd205;
+    wire [17:0] vy_prod = {9'b0, vy_loc} * 18'd205;
+    wire [4:0]  col_28  = vx_prod[15:11];   // 0..27
+    wire [4:0]  row_28  = vy_prod[15:11];   // 0..27
+
+    // buf_addr = row_28 * 28 + col_28
+    wire [9:0] buf_addr = ({5'b0, row_28} << 5)
+                        - ({5'b0, row_28} << 2)
+                        + {5'b0, col_28};
+
+    wire [3:0] up_gray     = snapshot_buf[buf_addr][7:4];
+    wire       on_up_border = in_up && (
+        vga_x == UP_X0           || vga_x == UP_X0 + 10'd279 ||
+        vga_y == UP_Y0           || vga_y == UP_Y0 + 10'd279
+    );
+
+    // ============================================================
+    // VGA 출력 합성 (좌: 카메라 원본 / 우: 28×28 × 10배 업스케일)
+    // ============================================================
+    wire [3:0] out_r =
+        on_divider    ? 4'hF :
+        in_cam        ? (on_border ? 4'hF : (on_blue_border ? 4'h0 : gray4)) :
+        in_up         ? (on_up_border ? 4'hF : up_gray) :
+        4'b0;
+
+    wire [3:0] out_g =
+        on_divider    ? 4'hF :
+        in_cam        ? (on_border ? 4'h0 : (on_blue_border ? 4'h0 : gray4)) :
+        in_up         ? (on_up_border ? 4'hF : up_gray) :
+        4'b0;
+
+    wire [3:0] out_b =
+        on_divider    ? 4'hF :
+        in_cam        ? (on_border ? 4'h0 : (on_blue_border ? 4'hF : gray4)) :
+        in_up         ? (on_up_border ? 4'hF : up_gray) :
+        4'b0;
+
+    assign vgaRed   = vga_active ? out_r : 4'b0;
+    assign vgaGreen = vga_active ? out_g : 4'b0;
+    assign vgaBlue  = vga_active ? out_b : 4'b0;
+
+    // ============================================================
+    // LED 출력 (4프레임 연속 동일 결과 시 갱신, NONE은 즉시 반영)
+    //   4'b0000 : 흰 배경 (NONE + 잉크 부족)
+    //   4'b1111 : 검은 배경 (NONE + 잉크 과다 / 카메라 가려짐)
+    //   4'b0001 : ○ (원)
+    //   4'b0111 : △ (삼각형)
+    //   4'b1110 : + (십자)
     // ============================================================
     reg [3:0] led_reg    = 4'b0000;
     reg [1:0] last_shape = 2'b00;
@@ -188,7 +296,8 @@ module top_camera_shape (
     always @(posedge clk_25mhz) begin
         if (shape_valid) begin
             if (shape == 2'b00) begin
-                led_reg    <= 4'b0000;
+                // NONE: 흰/검은 배경 즉시 반영
+                led_reg    <= is_dark ? 4'b1111 : 4'b0000;
                 stable_cnt <= 3'd0;
                 last_shape <= 2'b00;
             end else if (shape == last_shape) begin
@@ -198,7 +307,7 @@ module top_camera_shape (
                     case (shape)
                         2'b01:   led_reg <= 4'b0001;  // ○
                         2'b10:   led_reg <= 4'b0111;  // △
-                        2'b11:   led_reg <= 4'b1111;  // □
+                        2'b11:   led_reg <= 4'b1110;  // +
                         default: led_reg <= 4'b0000;
                     endcase
                 end
