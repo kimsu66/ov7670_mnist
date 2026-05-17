@@ -13,9 +13,10 @@
 // LED 인코딩:
 //   4'b0000 : 흰 배경 (잉크 부족 → 아무것도 없는 화면)
 //   4'b1111 : 검은 배경 (잉크 과다 → 카메라 가려짐)
-//   4'b0001 : ○ (원)
-//   4'b0111 : △ (삼각형)
-//   4'b1110 : + (십자)
+//   4'b1010 : 미인식 (유효 잉크이나 도형 조건 미충족)
+//   4'b0001 : ○ (원, 채워진)
+//   4'b0111 : □ (사각형, 속 빈 윤곽선)
+//   4'b1110 : +× (십자 또는 대각 십자)
 //
 // 4프레임 연속 동일 결과 시 LED 갱신 (흔들림 방지, NONE 제외)
 
@@ -137,11 +138,12 @@ module top_camera_shape (
     );
 
     // ============================================================
-    // shape_classifier: 28×28 스트림 → ○ △ + 분류
+    // shape_classifier: 28×28 스트림 → ○ □ + 분류
     // ============================================================
     wire [1:0] shape;
     wire       shape_valid;
     wire       is_dark;
+    wire       is_unknown;
 
     shape_classifier u_shape (
         .clk          (clk_25mhz),
@@ -151,7 +153,8 @@ module top_camera_shape (
         .frame_done   (frame_done),
         .shape        (shape),
         .shape_valid  (shape_valid),
-        .is_dark      (is_dark)
+        .is_dark      (is_dark),
+        .is_unknown   (is_unknown)
     );
 
     // ============================================================
@@ -257,23 +260,39 @@ module top_camera_shape (
     );
 
     // ============================================================
+    // 3×3 grid 오버레이 (우측 패널)
+    //
+    // 28픽셀을 9/10/9로 분할 → ×10배 → 90/100/90 픽셀
+    // 경계: x or y 방향 offset 90, 190 (= 90+100) 위치에 2픽셀 빨간 선
+    // ============================================================
+    wire on_grid = in_up && (
+        (vga_x == UP_X0 + 10'd90)  || (vga_x == UP_X0 + 10'd91)  ||
+        (vga_x == UP_X0 + 10'd190) || (vga_x == UP_X0 + 10'd191) ||
+        (vga_y == UP_Y0 + 10'd90)  || (vga_y == UP_Y0 + 10'd91)  ||
+        (vga_y == UP_Y0 + 10'd190) || (vga_y == UP_Y0 + 10'd191)
+    );
+
+    // ============================================================
     // VGA 출력 합성 (좌: 카메라 원본 / 우: 28×28 × 10배 업스케일)
     // ============================================================
     wire [3:0] out_r =
         on_divider    ? 4'hF :
         in_cam        ? (on_border ? 4'hF : (on_blue_border ? 4'h0 : gray4)) :
+        on_grid       ? 4'hF :
         in_up         ? (on_up_border ? 4'hF : up_gray) :
         4'b0;
 
     wire [3:0] out_g =
         on_divider    ? 4'hF :
         in_cam        ? (on_border ? 4'h0 : (on_blue_border ? 4'h0 : gray4)) :
+        on_grid       ? 4'h0 :
         in_up         ? (on_up_border ? 4'hF : up_gray) :
         4'b0;
 
     wire [3:0] out_b =
         on_divider    ? 4'hF :
         in_cam        ? (on_border ? 4'h0 : (on_blue_border ? 4'hF : gray4)) :
+        on_grid       ? 4'h0 :
         in_up         ? (on_up_border ? 4'hF : up_gray) :
         4'b0;
 
@@ -282,12 +301,13 @@ module top_camera_shape (
     assign vgaBlue  = vga_active ? out_b : 4'b0;
 
     // ============================================================
-    // LED 출력 (4프레임 연속 동일 결과 시 갱신, NONE은 즉시 반영)
+    // LED 출력 (4프레임 연속 동일 결과 시 갱신, NONE/UNKNOWN은 즉시 반영)
     //   4'b0000 : 흰 배경 (NONE + 잉크 부족)
     //   4'b1111 : 검은 배경 (NONE + 잉크 과다 / 카메라 가려짐)
-    //   4'b0001 : ○ (원)
-    //   4'b0111 : △ (삼각형)
-    //   4'b1110 : + (십자)
+    //   4'b1010 : 미인식 (유효 잉크이나 도형 조건 미충족)
+    //   4'b0001 : ○ (원, 채워진)
+    //   4'b0111 : □ (사각형, 속 빈 윤곽선)
+    //   4'b1110 : +× (십자 또는 대각 십자)
     // ============================================================
     reg [3:0] led_reg    = 4'b0000;
     reg [1:0] last_shape = 2'b00;
@@ -296,8 +316,13 @@ module top_camera_shape (
     always @(posedge clk_25mhz) begin
         if (shape_valid) begin
             if (shape == 2'b00) begin
-                // NONE: 흰/검은 배경 즉시 반영
-                led_reg    <= is_dark ? 4'b1111 : 4'b0000;
+                // NONE / UNKNOWN: 즉시 반영
+                if (is_dark)
+                    led_reg <= 4'b1111;
+                else if (is_unknown)
+                    led_reg <= 4'b1010;
+                else
+                    led_reg <= 4'b0000;
                 stable_cnt <= 3'd0;
                 last_shape <= 2'b00;
             end else if (shape == last_shape) begin
@@ -306,8 +331,8 @@ module top_camera_shape (
                 if (stable_cnt >= 3'd4) begin
                     case (shape)
                         2'b01:   led_reg <= 4'b0001;  // ○
-                        2'b10:   led_reg <= 4'b0111;  // △
-                        2'b11:   led_reg <= 4'b1110;  // +
+                        2'b10:   led_reg <= 4'b0111;  // □
+                        2'b11:   led_reg <= 4'b1110;  // +×
                         default: led_reg <= 4'b0000;
                     endcase
                 end
