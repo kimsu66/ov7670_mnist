@@ -139,22 +139,18 @@ module fc1_layer (
                 // -----------------------------------------------
                 COMPUTE: begin
                     out_valid <= 0;
-                    // weight BRAM 주소 세팅 (다음 클럭에 w_data 유효)
-//                    w_addr <= neuron_idx * 784 + pixel_idx;
-                    w_addr <= ({10'd0, neuron_idx} * 16'd784) + {6'd0, pixel_idx};
-                    
+
+                    // pixel_idx < 784 일 때만 주소 세팅
+                    if (pixel_idx < 784) begin
+                        w_addr <= ({10'd0, neuron_idx} * 16'd784) + {6'd0, pixel_idx};
+                    end
+
                     if (pixel_idx > 0) begin
-                        // w_data: 현재 클럭에서 읽힌 w[neuron][pixel_idx-1]
-                        // pixel_buf[pixel_idx-1]: x[pixel_idx-1]
-                        // MAC: accumulator += w * x
                         accumulator <= accumulator +
                             $signed(w_data) * $signed({1'b0, pixel_buf[pixel_idx - 1]});
-                            // pixel은 0~255 양수이므로 부호비트 0 붙여서 signed 처리
                     end
 
                     if (pixel_idx == 784) begin
-                        // 784개 픽셀 전부 처리 완료
-                        // b_addr 세팅 후 1클럭 대기해야 b_data 유효
                         b_addr <= neuron_idx;
                         state  <= BIAS_WAIT;
                     end else begin

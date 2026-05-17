@@ -32,11 +32,11 @@ module fc2_layer (
     // 연산용
     reg  [3:0]         neuron_idx;  // 0~9
     reg  [6:0]         act_idx;     // 0~64 (64 도달 확인용으로 7비트 필요)
-    reg  signed [19:0] accumulator;
-    // INT8*INT8*64 = 127*127*64 ≈ 1M → 20비트로 충분
+    reg  signed [23:0] accumulator;
+    // INT8*INT8*64 = 127*127*64 ≈ 1M → 24비트 (20비트는 오버플로우 가능)
 
-    wire signed [19:0] acc_with_bias;
-    assign acc_with_bias = accumulator + $signed(b_data);
+    wire signed [23:0] acc_with_bias;
+    assign acc_with_bias = accumulator + $signed({{16{b_data[7]}}, b_data});
 
     // BRAM 인스턴스
     fc2_weight fc2_weight_bram (
@@ -58,6 +58,7 @@ module fc2_layer (
             neuron_idx  <= 0;
             act_idx     <= 0;
             accumulator <= 0;
+            out_data    <= 0;
             out_valid   <= 0;
             done        <= 0;
         end else begin
@@ -91,7 +92,10 @@ module fc2_layer (
                 // MAC: y[neuron] += w[neuron][act] * act[act]
                 COMPUTE: begin
                     out_valid <= 0;
-                    w_addr <= ({6'd0, neuron_idx} * 10'd64) + {4'd0, act_idx};
+
+                    if (act_idx < 64) begin  // ← 조건 추가
+                        w_addr <= ({6'd0, neuron_idx} * 10'd64) + {4'd0, act_idx};
+                    end
 
                     if (act_idx > 0) begin
                         accumulator <= accumulator +
@@ -99,7 +103,6 @@ module fc2_layer (
                     end
 
                     if (act_idx == 64) begin
-                        // 마지막 act_buf[63]도 누적됨 (act_idx>0 블록)
                         b_addr <= neuron_idx;
                         state  <= BIAS_WAIT;
                     end else begin

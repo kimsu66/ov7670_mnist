@@ -223,17 +223,20 @@ module top_camera_mnist (
 
     // ============================================================
     // 픽셀 버퍼: box_sampler가 출력하는 784픽셀을 순서대로 저장 (라이브 쓰기 버퍼)
-    //
-    // 4비트 그레이값(0~15)으로 전달: 학습 코드가 x*15 변환으로
-    // 0~15 범위를 입력으로 사용했으므로 FPGA도 동일하게 맞춤.
-    // sampled_pixel = {avg4, avg4} 형태이므로 [7:4]가 실제 4비트 평균값.
+    // 임계값(PIXEL_THR) 미만 → 0 (배경 노이즈 제거)
+    // 이 값이 화면(280×280)과 MNIST 입력에 모두 동일하게 사용됨
     // ============================================================
+    localparam [3:0] PIXEL_THR = 4'd4;  // 0~15 중 이 값 미만은 0으로
+
+    wire [3:0] avg4_raw  = sampled_pixel[7:4];
+    wire [3:0] avg4_thr  = (avg4_raw >= PIXEL_THR) ? avg4_raw : 4'b0;
+
     reg [7:0] pixel_buf [0:783];
     reg [9:0] buf_wr_cnt = 10'd0;
 
     always @(posedge clk_25mhz) begin
         if (sampled_valid) begin
-            pixel_buf[buf_wr_cnt] <= {4'b0, sampled_pixel[7:4]};  // 0~15
+            pixel_buf[buf_wr_cnt] <= {4'b0, avg4_thr};  // 임계값 적용된 0~15
             buf_wr_cnt <= frame_done ? 10'd0 : buf_wr_cnt + 10'd1;
         end else if (frame_done) begin
             buf_wr_cnt <= 10'd0;
