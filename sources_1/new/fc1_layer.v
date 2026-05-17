@@ -13,7 +13,7 @@ module fc1_layer (
 
     localparam IDLE       = 3'd0;
     localparam LOAD       = 3'd1;
-    localparam ADDR_SETUP = 3'd2;  // 추가: BRAM addr 세팅 준비 사이클
+    localparam ADDR_SETUP = 3'd2;
     localparam COMPUTE    = 3'd3;
     localparam BIAS_WAIT  = 3'd4;
     localparam OUTPUT     = 3'd5;
@@ -32,8 +32,14 @@ module fc1_layer (
     reg  [5:0]         neuron_idx;
     reg  [9:0]         pixel_idx;
     reg  signed [23:0] accumulator;
+
+    wire signed [7:0]  w_data_s;
+    wire signed [7:0]  b_data_s;
     wire signed [23:0] acc_with_bias;
-    assign acc_with_bias = accumulator + $signed({{16{b_data[7]}}, b_data});
+
+    assign w_data_s      = w_data;
+    assign b_data_s      = b_data;
+    assign acc_with_bias = accumulator + {{16{b_data_s[7]}}, b_data_s};
 
     blk_mem_gen_0 fc1_weight_bram (
         .clka  (clk),
@@ -50,92 +56,99 @@ module fc1_layer (
     always @(posedge clk or posedge rst) begin
         if (rst) begin
             state       <= IDLE;
-            pixel_cnt   <= 0;
-            neuron_idx  <= 0;
-            pixel_idx   <= 0;
-            accumulator <= 0;
-            out_valid   <= 0;
-            done        <= 0;
-            w_addr      <= 0;
-            b_addr      <= 0;
+            pixel_cnt   <= 10'd0;
+            neuron_idx  <= 6'd0;
+            pixel_idx   <= 10'd0;
+            accumulator <= 24'sd0;
+            out_data    <= 8'd0;
+            out_valid   <= 1'b0;
+            done        <= 1'b0;
+            w_addr      <= 16'd0;
+            b_addr      <= 6'd0;
         end else begin
+            // out_valid/done은 반드시 1-cycle pulse로만 발생시킨다.
+            // 기존 코드에서는 OUTPUT 다음 ADDR_SETUP/COMPUTE에서 값이 유지되어
+            // 상위 mnist_core가 동일한 activation/score를 중복 캡처하는 문제가 있었다.
+            out_valid <= 1'b0;
+            done      <= 1'b0;
+
             case (state)
 
                 IDLE: begin
-                    out_valid <= 0;
-                    done      <= 0;
                     if (start) begin
-                        pixel_cnt <= 0;
+                        pixel_cnt <= 10'd0;
                         state     <= LOAD;
                     end
                 end
 
                 LOAD: begin
                     if (pixel_valid) begin
-                        pixel_buf[pixel_cnt] <= pixel_data;
-                        pixel_cnt <= pixel_cnt + 1;
-                        if (pixel_cnt == 783) begin
-                            neuron_idx  <= 0;
-                            accumulator <= 0;
-                            state       <= ADDR_SETUP;  // COMPUTE 대신 ADDR_SETUP
+                        // Python reference는 4-bit grayscale 0~15 입력 기준.
+                        pixel_buf[pixel_cnt] <= {4'b0000, pixel_data[3:0]};
+                        pixel_cnt <= pixel_cnt + 10'd1;
+
+                        if (pixel_cnt == 10'd783) begin
+                            neuron_idx  <= 6'd0;
+                            accumulator <= 24'sd0;
+                            state       <= ADDR_SETUP;
                         end
                     end
                 end
 
-                // BRAM addr 첫 번째 세팅 사이클
-                // pixel_idx=0 기준으로 addr 세팅, pixel_idx를 1로 올림
-                // 다음 사이클(COMPUTE)에서 w_data[0]이 유효
+                // BRAM read latency 1-cycle 가정: addr[neuron][0] 설정
                 ADDR_SETUP: begin
-                    w_addr    <= {10'd0, neuron_idx} * 16'd784;  // neuron*784 + 0
-                    pixel_idx <= 1;
+                    w_addr    <= ({10'd0, neuron_idx} * 16'd784);
+                    pixel_idx <= 10'd1;
                     state     <= COMPUTE;
                 end
 
-                // MAC 연산
-                // pixel_idx=1일 때: w_data = w[neuron][0] 유효
-                //   → pixel_buf[0]과 곱 (pixel_idx-1=0)
-                // pixel_idx=784일 때: w_data = w[neuron][783] 유효
-                //   → pixel_buf[783]과 곱 후 BIAS_WAIT
+                // pixel_idx=1일 때 w_data는 w[neuron][0]에 대응
+                // pixel_idx=784일 때 w_data는 w[neuron][783]에 대응
                 COMPUTE: begin
-                    out_valid <= 0;
-
-                    // 다음 주소 세팅 (784 이전까지만)
-                    if (pixel_idx < 784) begin
+                    if (pixel_idx < 10'd784) begin
                         w_addr <= ({10'd0, neuron_idx} * 16'd784) + {6'd0, pixel_idx};
                     end
 
-                    // 현재 w_data (pixel_idx-1 기준) 누적
-                    accumulator <= accumulator +
-                        $signed(w_data) * $signed({1'b0, pixel_buf[pixel_idx - 1]});
+                    accumulator <= accumulator
+                                 + ($signed(w_data_s) * $signed({1'b0, pixel_buf[pixel_idx - 10'd1]}));
 
-                    if (pixel_idx == 784) begin
+                    if (pixel_idx == 10'd784) begin
                         b_addr <= neuron_idx;
                         state  <= BIAS_WAIT;
                     end else begin
-                        pixel_idx <= pixel_idx + 1;
+                        pixel_idx <= pixel_idx + 10'd1;
                     end
                 end
 
+                // bias BRAM read latency 1-cycle 가정
                 BIAS_WAIT: begin
                     state <= OUTPUT;
                 end
 
                 OUTPUT: begin
-                    if ($signed(acc_with_bias) > 0) begin
-                        out_data <= (acc_with_bias > 24'sd127) ? 8'd127 : acc_with_bias[7:0];
-                    end else begin
+                    // Python: act1 = clip(max(z1, 0), 0, 127)
+                    if (acc_with_bias <= 24'sd0) begin
                         out_data <= 8'd0;
+                    end else if (acc_with_bias >= 24'sd127) begin
+                        out_data <= 8'd127;
+                    end else begin
+                        out_data <= acc_with_bias[7:0];
                     end
-                    out_valid <= 1;
 
-                    if (neuron_idx == 63) begin
-                        done  <= 1;
+                    out_valid <= 1'b1;
+
+                    if (neuron_idx == 6'd63) begin
+                        done  <= 1'b1;
                         state <= IDLE;
                     end else begin
-                        neuron_idx  <= neuron_idx + 1;
-                        accumulator <= 0;
-                        state       <= ADDR_SETUP;  // COMPUTE 대신 ADDR_SETUP
+                        neuron_idx  <= neuron_idx + 6'd1;
+                        accumulator <= 24'sd0;
+                        state       <= ADDR_SETUP;
                     end
+                end
+
+                default: begin
+                    state <= IDLE;
                 end
 
             endcase

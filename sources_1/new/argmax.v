@@ -1,3 +1,5 @@
+`timescale 1ns / 1ps
+
 module argmax (
     input  wire        clk,
     input  wire        rst,
@@ -8,41 +10,37 @@ module argmax (
     output reg         done
 );
 
-    // =========================================================
-    // 동작:
-    // score 10개를 순서대로 받아서
-    // 가장 큰 값의 인덱스를 result에 저장
-    // =========================================================
+    // score 10개를 순서대로 받아 가장 큰 값의 인덱스를 result에 저장한다.
+    // start와 score_valid가 같은 cycle에 겹칠 경우 start를 우선하여 새 비교를 초기화한다.
+    // 10개 이후의 score_valid는 방어적으로 무시한다.
 
-    reg signed [23:0] max_val;   // 현재까지 최댓값
-    reg [3:0]         score_cnt; // 몇 개 받았는지 (0~9)
+    reg signed [23:0] max_val;
+    reg [3:0]         score_cnt;
 
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            result    <= 0;
-            done      <= 0;
-            max_val   <= 24'sh800000;  // 최솟값 (signed 16비트 최솟값)
-            score_cnt <= 0;
+            result    <= 4'd0;
+            done      <= 1'b0;
+            max_val   <= 24'sh800000;
+            score_cnt <= 4'd0;
         end else begin
-            done <= 0;
+            done <= 1'b0;
 
             if (start) begin
                 max_val   <= 24'sh800000;
-                score_cnt <= 0;
-                result    <= 0;
-                done      <= 0;
-            end
-
-            if (score_valid) begin
+                score_cnt <= 4'd0;
+                result    <= 4'd0;
+            end else if (score_valid && (score_cnt < 4'd10)) begin
                 if ($signed(score_data) > $signed(max_val)) begin
                     max_val <= score_data;
                     result  <= score_cnt;
                 end
-                score_cnt <= score_cnt + 1;
 
-                if (score_cnt == 9) begin
-                    done <= 1;
+                if (score_cnt == 4'd9) begin
+                    done <= 1'b1;
                 end
+
+                score_cnt <= score_cnt + 4'd1;
             end
         end
     end

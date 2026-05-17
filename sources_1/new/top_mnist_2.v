@@ -17,7 +17,7 @@
 // ============================================================
 //  fc1_layer
 // ============================================================
-module fc1_layer (
+module fc1_v2 (
     input  wire        clk,
     input  wire        rst,
 
@@ -155,7 +155,7 @@ endmodule
 // ============================================================
 //  fc2_layer
 // ============================================================
-module fc2_layer (
+module fc2_v2 (
     input  wire         clk,
     input  wire         rst,
 
@@ -335,7 +335,7 @@ module mnist_top (
     wire [447:0] act1_flat;
     wire         fc1_done;
 
-    fc1_layer u_fc1 (
+    fc1_v2 u_fc1 (
         .clk      (clk),
         .rst      (rst),
         .px_in    (px4),
@@ -347,7 +347,7 @@ module mnist_top (
     wire [319:0] logit_flat;
     wire         fc2_done;
 
-    fc2_layer u_fc2 (
+    fc2_v2 u_fc2 (
         .clk       (clk),
         .rst       (rst),
         .act1_flat (act1_flat),
